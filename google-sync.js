@@ -1,7 +1,8 @@
-/* Tempo V3: Google Calendar incremental prototype. Tokens only in memory. */
+/* Tempo V3.4: Google event color preservation. Tokens only in memory. */
 let googleToken = null;
 let googleTokenClient = null;
 let googleCalendars = [];
+let googleColors = null;
 const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly';
 const G_MAP_KEY = 'tempo-google-links-v3';
 const G_CAL_KEY = 'tempo-google-calendar-v3';
@@ -14,13 +15,13 @@ function connectGoogle(){
  const clientId=document.getElementById('googleClientId').value.trim();
  if(!clientId.endsWith('.apps.googleusercontent.com')){gStatus('Renseigne un ID client OAuth Google valide.');return;}
  if(location.protocol!=='https:' && location.hostname!=='localhost'){gStatus('Héberge cette application en HTTPS avant de connecter Google.');return;}
- if(!googleReady()){gStatus('La bibliothèque Google n’est pas encore chargée. Vérifie ta connexion Internet.');return;}
+ if(!googleReady()){gStatus('La bibliothèque Google n’est pas encore chargée. Vérifie ta connexion Internet.');window.tempoCheck?.();return;}
  localStorage.setItem(G_CLIENT_KEY,clientId);
- googleTokenClient=google.accounts.oauth2.initTokenClient({client_id:clientId,scope:GOOGLE_SCOPE,callback:async response=>{
+ try { googleTokenClient=google.accounts.oauth2.initTokenClient({client_id:clientId,scope:GOOGLE_SCOPE,callback:async response=>{
    if(response.error){gStatus('Connexion refusée : '+response.error);return;}
-   googleToken=response.access_token;gStatus('Google connecté pour cette session. Chargement des calendriers…');await loadGoogleCalendars();
+   googleToken=response.access_token;gStatus('Google connecté pour cette session. Chargement des calendriers…');await loadGoogleCalendars();if(document.getElementById('googleCalendar').value)await syncGoogle();
  }});
- googleTokenClient.requestAccessToken({prompt:'consent'});
+ googleTokenClient.requestAccessToken({prompt:'consent'}); } catch(e) {gStatus('Erreur de connexion : '+(e.message||e));window.tempoReport?.('Erreur Google OAuth : '+(e.message||e));}
 }
 async function gFetch(path,opts={}){
  if(!googleToken)throw Error('Reconnecte Google : la session a expiré ou n’est pas ouverte.');
@@ -38,22 +39,32 @@ async function loadGoogleCalendars(){
   select.replaceChildren();
   for(const c of googleCalendars){const opt=document.createElement('option');opt.value=c.id;opt.textContent=c.summary+(c.primary?' (principal)':'');select.appendChild(opt);}
   select.value=googleCalendars.some(c=>c.id===localStorage.getItem(G_CAL_KEY))?localStorage.getItem(G_CAL_KEY):googleCalendars[0]?.id||'';
+  try { googleColors=await gFetch('/colors'); } catch(e) { googleColors=null; }
   gStatus(googleCalendars.length+' calendrier(s) modifiable(s) trouvé(s). Sélectionne un calendrier, puis lance la synchronisation.');
  }catch(e){gStatus('Impossible de charger les calendriers : '+e.message);}
 }
 function googleEventFromItem(i){
+ const cat=getCategory(i);
+ if(i.allDay && i.endDateExclusive){return {summary:i.title,description:(i.notes||'')+'\n\n[Tempo ID: '+i.id+']',start:{date:i.date},end:{date:i.endDateExclusive},colorId:i.googleOriginalColorId||cat.googleColorId||closestGoogle(cat.color)};}
  const start=new Date(i.date+'T'+i.start+':00');
  const end=new Date(start.getTime()+Number(i.duration)*60000);
- const cat=getCategory(i);
- return {summary:i.title,description:(i.notes||'')+'\n\n[Tempo ID: '+i.id+']',start:{dateTime:start.toISOString()},end:{dateTime:end.toISOString()},colorId:cat.googleColorId||closestGoogle(cat.color)};
+ return {summary:i.title,description:(i.notes||'')+'\n\n[Tempo ID: '+i.id+']',start:{dateTime:start.toISOString()},end:{dateTime:end.toISOString()},colorId:i.googleOriginalColorId||cat.googleColorId||closestGoogle(cat.color)};
+}
+function googleColorOf(e,calendarId){
+ const calendar=googleCalendars.find(c=>c.id===calendarId);
+ const explicit=e.colorId ? (googleColors?.event?.[String(e.colorId)]?.background || googlePalette.find(p=>p[0]===String(e.colorId))?.[1]) : null;
+ return explicit || calendar?.backgroundColor || '#7986cb';
 }
 function localFromGoogle(e,calendarId){
- const start=e.start?.dateTime;
- if(!start||e.status==='cancelled')return null;
- const d=new Date(start),end=new Date(e.end?.dateTime||start);
- if(!Number.isFinite(d.getTime()))return null;
- return {id:crypto.randomUUID(),title:e.summary||'Sans titre',destination:'google-personal',category:'pers',date:localDate(d),start:String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),duration:Math.max(5,Math.round((end-d)/60000)),priority:'Normale',notes:(e.description||'').replace(/\n\n\[Tempo ID: [^\]]+\]/g,''),photo:'',reminder:0};
+ if(e.status==='cancelled')return null;
+ const allDay=Boolean(e.start?.date);
+ const rawStart=allDay?e.start.date:e.start?.dateTime;
+ if(!rawStart)return null;
+ const d=allDay?new Date(rawStart+'T12:00:00'):new Date(rawStart);
+ const end=allDay?new Date((e.end?.date||rawStart)+'T12:00:00'):new Date(e.end?.dateTime||rawStart);
+ return {id:crypto.randomUUID(),title:e.summary||'Sans titre',destination:'google-personal',category:'pers',googleImported:true,googleOriginalColor:googleColorOf(e,calendarId),googleOriginalColorId:e.colorId||null,date:localDate(d),start:allDay?'00:00':String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),duration:Math.max(5,Math.round((end-d)/60000)),allDay,endDateExclusive:allDay?(e.end?.date||rawStart):null,priority:'Normale',notes:(e.description||'').replace(/\n\n\[Tempo ID: [^\]]+\]/g,''),photo:'',reminder:0};
 }
+
 async function syncGoogle(){
  const cal=document.getElementById('googleCalendar').value;
  if(!googleToken){gStatus('Connecte Google avant de synchroniser.');return;}
@@ -79,6 +90,22 @@ async function syncGoogle(){
    items.push(newItem);
    googleLinks[newItem.id]={calendarId:cal,eventId:e.id,etag:e.etag,localHash:JSON.stringify(googleEventFromItem(newItem))};
    imported++;
+  }
+  // Refresh Google-origin colors without replacing locally modified event details.
+  for(const [localId,link] of Object.entries(googleLinks)){
+   if(link.calendarId!==cal)continue;
+   const local=items.find(x=>x.id===localId);
+   const remoteEvent=byId.get(link.eventId);
+   if(!local || !remoteEvent || remoteEvent.status==='cancelled')continue;
+   if(!local.googleImported && !('googleOriginalColor' in local) && JSON.stringify(googleEventFromItem(local))===link.localHash)local.googleImported=true;
+   if(!local.googleImported)continue;
+   if(JSON.stringify(googleEventFromItem(local))===link.localHash){
+    local.googleOriginalColor=googleColorOf(remoteEvent,cal);
+    local.googleOriginalColorId=remoteEvent.colorId||null;
+    // Keep original category for imported items; the Google color is rendered independently.
+    link.etag=remoteEvent.etag;
+    link.localHash=JSON.stringify(googleEventFromItem(local));
+   }
   }
   // Publish only items explicitly targeted to Google; do not upload internal tasks.
   for(const i of items.filter(x=>x.destination==='google-personal'||x.destination==='google-work')){
